@@ -8,6 +8,8 @@ import {
 } from '@envelop/opentelemetry';
 import { hashObject } from '@graphql-mesh/string-interpolation';
 import { type MeshPlugin, type MeshPluginOptions } from '@graphql-mesh/types';
+import { createDefaultExecutor } from '@graphql-tools/delegate';
+import { type ExecutionRequest } from '@graphql-tools/utils';
 import * as opentelemetry from '@opentelemetry/api';
 import { SpanKind } from '@opentelemetry/api';
 import { AsyncHooksContextManager } from '@opentelemetry/context-async-hooks';
@@ -15,7 +17,11 @@ import { CompositePropagator, W3CTraceContextPropagator } from '@opentelemetry/c
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-grpc';
 import { B3InjectEncoding, B3Propagator } from '@opentelemetry/propagator-b3';
 import { Resource } from '@opentelemetry/resources';
-import { ConsoleSpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import {
+    BatchSpanProcessor,
+    ConsoleSpanExporter,
+    SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace-base';
 import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import {
     SEMRESATTRS_DEPLOYMENT_ENVIRONMENT,
@@ -69,7 +75,11 @@ export default function useOpenTelemetry(
         });
     }
 
-    tracingProvider.addSpanProcessor(new SimpleSpanProcessor(exporter));
+    tracingProvider.addSpanProcessor(
+        options.batch
+            ? new BatchSpanProcessor(exporter, options.batch)
+            : new SimpleSpanProcessor(exporter),
+    );
     tracingProvider.register();
 
     const tracer = tracingProvider.getTracer(options.serviceName ?? 'graphql-mesh');
@@ -95,7 +105,7 @@ export default function useOpenTelemetry(
     return {
         onPluginInit: function ({ addPlugin }) {
             addPlugin({
-                onExecute({ args, extendContext }) {
+                onExecute({ args }) {
                     const parentContext = propagator.extract(
                         getCurrentOtelContext(args.contextValue),
                         args.contextValue.request.headers,
@@ -109,38 +119,6 @@ export default function useOpenTelemetry(
                         },
                     );
                     setCurrentOtelContext(args.contextValue, parentContext);
-
-                    extendContext({
-                        propagator: new Proxy(args.contextValue, {
-                            get: function (context, field: string): string | undefined {
-                                const currOtelContext =
-                                    // @ts-expect-error
-                                    contextManager._stack.length > 0
-                                        ? contextManager.active()
-                                        : getCurrentOtelContext(context);
-
-                                const propagators: Record<string, string | undefined> = {
-                                    traceId: opentelemetry.trace
-                                        .getSpan(currOtelContext)
-                                        ?.spanContext().traceId,
-                                };
-
-                                propagator.inject(currOtelContext, propagators, {
-                                    set(
-                                        carrier: Record<string, string>,
-                                        key: string,
-                                        value: string,
-                                    ): void {
-                                        carrier[camelCase(key)] = value;
-                                    },
-                                });
-
-                                return Object.keys(propagators).includes(field)
-                                    ? propagators[field]
-                                    : undefined;
-                            },
-                        }),
-                    } as any);
                 },
             } as Plugin);
             addPlugin(
@@ -225,10 +203,48 @@ export default function useOpenTelemetry(
 
             spanByPath.set(currentPath, delegateSpan);
 
+            const currentContext = opentelemetry.trace.setSpan(currOtelContext, delegateSpan);
             // @ts-expect-error
-            contextManager._enterContext(
-                opentelemetry.trace.setSpan(currOtelContext, delegateSpan),
-            );
+            contextManager._enterContext(currentContext);
+
+            // @ts-expect-error
+            if (!payload.schema?._withoutOpentelemtryExecutor) {
+                // @ts-expect-error
+                payload.schema._withoutOpentelemtryExecutor =
+                    // @ts-expect-error
+                    payload.schema?.executor || createDefaultExecutor(payload.schema?.schema);
+            }
+
+            // @ts-expect-error
+            payload.schema.executor = async (request: ExecutionRequest) => {
+                if (request.context && !request.context?.propagator) {
+                    request.context.propagator = new Proxy(request.context, {
+                        get: function (_requestInfo, field: string): string | undefined {
+                            const propagators: Record<string, string | undefined> = {
+                                traceId: opentelemetry.trace.getSpan(currentContext)?.spanContext()
+                                    .traceId,
+                            };
+
+                            propagator.inject(currentContext, propagators, {
+                                set(
+                                    carrier: Record<string, string>,
+                                    key: string,
+                                    value: string,
+                                ): void {
+                                    carrier[camelCase(key)] = value;
+                                },
+                            });
+
+                            return Object.keys(propagators).includes(field)
+                                ? propagators[field]
+                                : undefined;
+                        },
+                    });
+                }
+
+                // @ts-expect-error
+                return payload.schema._withoutOpentelemtryExecutor(request);
+            };
 
             return ({ result }) => {
                 if (result instanceof Error) {

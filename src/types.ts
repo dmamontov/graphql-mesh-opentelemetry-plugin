@@ -9,4 +9,12 @@ export interface OpentelemetryPluginConfig {
     document: boolean | string;
     delegationArgs: boolean | string;
     traceIdInResult: boolean | string;
+    batch?: OpentelemetryPluginBatchConfig;
+}
+
+export interface OpentelemetryPluginBatchConfig {
+    maxQueueSize: number;
+    maxExportBatchSize: number;
+    scheduledDelayMillis: number;
+    exportTimeoutMillis: number;
 }
