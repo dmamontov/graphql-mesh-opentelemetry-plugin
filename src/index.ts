@@ -57,6 +57,7 @@ export default function useOpenTelemetry(
 
     const spanByPath = new WeakMap<any, opentelemetry.Span>();
     const wrappedTraceKeys = new WeakMap<any, Set<string>>();
+    const spanByContext = new WeakMap<any, Record<string, any>>();
 
     const tracingProvider = new NodeTracerProvider({
         resource: Resource.default().merge(
@@ -203,9 +204,10 @@ export default function useOpenTelemetry(
 
             spanByPath.set(currentPath, delegateSpan);
 
-            const currentContext = opentelemetry.trace.setSpan(currOtelContext, delegateSpan);
-            // @ts-expect-error
-            contextManager._enterContext(currentContext);
+            spanByContext.set(payload.context, {
+                span: delegateSpan,
+                context: opentelemetry.trace.setSpan(currOtelContext, delegateSpan),
+            });
 
             // @ts-expect-error
             if (!payload.schema?._withoutOpentelemtryExecutor) {
@@ -217,15 +219,17 @@ export default function useOpenTelemetry(
 
             // @ts-expect-error
             payload.schema.executor = async (request: ExecutionRequest) => {
-                if (request.context && !request.context?.propagator) {
-                    request.context.propagator = new Proxy(request.context, {
-                        get: function (_requestInfo, field: string): string | undefined {
-                            const propagators: Record<string, string | undefined> = {
-                                traceId: opentelemetry.trace.getSpan(currentContext)?.spanContext()
-                                    .traceId,
-                            };
+                if (request.context) {
+                    const propagators: Record<string, string | undefined> = {};
 
-                            propagator.inject(currentContext, propagators, {
+                    if (spanByContext.has(request.context)) {
+                        const { span, context } = spanByContext.get(request.context);
+                        if (span) {
+                            propagators.traceId = span?.spanContext().traceId;
+                        }
+
+                        if (context) {
+                            propagator.inject(context, propagators, {
                                 set(
                                     carrier: Record<string, string>,
                                     key: string,
@@ -234,12 +238,10 @@ export default function useOpenTelemetry(
                                     carrier[camelCase(key)] = value;
                                 },
                             });
+                        }
+                    }
 
-                            return Object.keys(propagators).includes(field)
-                                ? propagators[field]
-                                : undefined;
-                        },
-                    });
+                    request.context.propagator = propagators;
                 }
 
                 // @ts-expect-error
@@ -259,10 +261,11 @@ export default function useOpenTelemetry(
                     );
                 }
 
-                delegateSpan.end();
+                if (spanByContext.has(payload.context)) {
+                    spanByContext.delete(payload.context);
+                }
 
-                // @ts-expect-error
-                contextManager._exitContext();
+                delegateSpan.end();
             };
         },
     };
